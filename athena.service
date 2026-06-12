@@ -1,0 +1,14 @@
+[Unit]
+Description=Athena Security Daemon
+After=network.target
+Requires=systemd-journald.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/athena-server
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

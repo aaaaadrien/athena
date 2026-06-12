@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+# 1. Vérification des privilèges root
+if [[ $EUID -ne 0 ]]
+then
+    echo "Erreur : ce script doit être exécuté en root." >&2
+    exit 1
+fi
+
+# 2. Chargement de la configuration
+if [ -f "/etc/athena/athena.conf" ]
+then
+    source /etc/athena/athena.conf
+elif [ -f "./athena.conf" ]
+then
+    source ./athena.conf
+else
+    echo "Erreur : Fichier athena.conf introuvable." >&2
+    exit 1
+fi
+
+# Définition des constantes nftables
+SET_NAME="athena_blacklist"
+TABLE_NAME="athena"
+
+# Fonction d'affichage de l'aide
+usage() {
+    echo "Usage: athena [-l] [-u IP]"
+    echo "  -l      Lister les IPs bannies et leur temps restant"
+    echo "  -u IP   Débannir manuellement une IP"
+    exit 1
+}
+
+# Vérification de la présence d'arguments
+if [ $# -eq 0 ]; then usage; fi
+
+# Traitement des options de ligne de commande
+while getopts "lu:" opt
+do
+    case $opt in
+        l)
+            echo "--- Liste des IPs bannies (Athena) ---"
+            # 1. 'nft list set' : Récupère le contenu du set de bannissement
+            # 2. 'grep expires' : Filtre pour ne garder que les entrées actives avec expiration
+            # 3. 'sed -E' : Utilise des expressions régulières pour formater l'affichage (nettoyage espaces, ajout parenthèses)
+            nft list set inet $TABLE_NAME $SET_NAME 2>/dev/null | grep 'expires' | sed -E 's/^[[:space:]]+//; s/ expires/ (temps restant :/; s/,? \}$//; s/$/)/' || echo "Aucune IP bannie."
+            exit 0
+            ;;
+        u)
+            IP="$OPTARG"
+            UNBAN_QUEUE="/run/athena/unban_queue"
+            # Envoi de l'IP à la file d'attente de débannissement
+            if [ -d "/run/athena" ]
+	    then
+                echo "$IP" >> "$UNBAN_QUEUE"
+                echo "Demande de débannissement pour $IP envoyée au serveur (traitement sous 5s)."
+            else
+                echo "Erreur : Le dossier /run/athena n'existe pas. Le serveur Athena est-il lancé ?"
+                exit 1
+            fi
+            exit 0
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
