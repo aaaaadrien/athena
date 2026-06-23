@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+VERSION="1.0"
+
+# 0. Vérification options
+case "$1" in
+    -v|--version)
+        echo "Athena Server Version $VERSION"
+        exit 0
+        ;;
+esac
 
 # 1. Vérification des privilèges root
 if [[ $EUID -ne 0 ]]
