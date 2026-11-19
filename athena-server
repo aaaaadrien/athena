@@ -1,190 +1,720 @@
 #!/usr/bin/env bash
-VERSION="1.0"
+#
+# athena-server — SSH brute-force blocker (nftables backend)
+# Part of Athena. Licensed under GPL-3.0.
+#
+# The daemon reads the journal (read-only), counts failed SSH logins per
+# source address over a sliding window, and bans offenders with nftables.
 
-# 0. Vérification options
-case "$1" in
-    -v|--version)
-        echo "Athena Server Version $VERSION"
-        exit 0
-        ;;
-esac
+# nft lives in sbin on most distributions; keep it reachable even when the
+# daemon is started by hand from a non-root login shell.
+PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/local/sbin:/usr/sbin:/sbin"
+export PATH
 
-# 1. Vérification des privilèges root
-if [[ $EUID -ne 0 ]]; then
-    echo "Erreur : ce script doit être exécuté en root." >&2
-    exit 1
-fi
+TABLE_NAME=athena
+SET_V4=athena_blacklist
+SET_V6=athena_blacklist6
 
-# 2. Chargement de la configuration
-if [ -f "/etc/athena/athena.conf" ]
-then
-    source /etc/athena/athena.conf
-elif [ -f "./athena.conf" ]
-then
-    source ./athena.conf
-else
-    echo "Erreur : Fichier athena.conf introuvable." >&2
-    exit 1
-fi
+CONF_FILE=${ATHENA_CONF:-/etc/athena/athena.conf}
+FALLBACK_CONF=${ATHENA_FALLBACK_CONF:-./athena.conf}
+VERSION_FILE=${ATHENA_VERSION_FILE:-/usr/share/athena/VERSION}
+RUN_DIR=${ATHENA_RUN_DIR:-/run/athena}
+STATE_DIR=${ATHENA_STATE_DIR:-/var/lib/athena}
+STATE_FILE=$STATE_DIR/bans
 
-# Valeurs par défaut si non définies dans la config
+# ip -> absolute expiry (epoch) of its ban, persisted across restarts.
+# ip -> epoch until which a manually unbanned address is left alone.
+declare -A BANS=()
+declare -A GRACE=()
+# ip -> space separated epochs of its recent failures (at most THRESHOLD).
+declare -A FAILS=()
+STATE_DIRTY=0
+# File descriptor of the running `journalctl -f`.
+STREAM_FD=""
+# When the failure table is due for pruning (see prune_failures).
+NEXT_FAIL_PRUNE=0
+
+
+# Defaults; each of these can be overridden from athena.conf.
 THRESHOLD=${THRESHOLD:-2}
 BAN_TIME=${BAN_TIME:-3600}
 FIND_TIME=${FIND_TIME:-600}
 CHECK_INTERVAL=${CHECK_INTERVAL:-5}
 WHITE_LIST=${WHITE_LIST:-"127.0.0.1"}
-PORT_BLOCK=${PORT_BLOCK:-"all"}
+PORT_BLOCK=${PORT_BLOCK:-all}
+# Syslog identifiers carrying sshd messages. OpenSSH >= 9.8 logs through
+# sshd-session, older releases through sshd; repeated -t matches are ORed.
+SSH_LOG_TAGS=${SSH_LOG_TAGS:-"sshd sshd-session"}
 
-# Variables internes
-SET_NAME="athena_blacklist"
-TABLE_NAME="athena"
-UNBAN_QUEUE="/run/athena/unban_queue"
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
 
-# Initialisation de l'environnement de travail
-mkdir -p /run/athena
-touch "$UNBAN_QUEUE"
-chmod 644 "$UNBAN_QUEUE"
+now() {
+    local t
+    printf -v t '%(%s)T' -1
+    printf '%s' "$t"
+}
 
-echo "--- Athena Server Démarré (Backend: nftables) ---"
+log_event() {
+    logger -t athena "$*" 2>/dev/null || printf '%s\n' "$*" >&2
+}
 
-# Convertit une adresse IP pointée en entier 32 bits
-ip_to_int() {
+athena_version() {
+    local vf=$VERSION_FILE v=""
+    if [[ ! -r $vf && -n ${BASH_SOURCE[0]:-} ]]; then
+        vf="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/VERSION"
+    fi
+    [[ -r $vf ]] && IFS= read -r v < "$vf"
+    printf '%s\n' "${v:-dev}"
+}
+
+# Fills JMATCH with one `-t <identifier>` per SSH_LOG_TAGS entry.
+journal_match_args() {
+    local tag
+    JMATCH=()
+    for tag in $SSH_LOG_TAGS; do
+        JMATCH+=(-t "$tag")
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Address helpers
+# ---------------------------------------------------------------------------
+
+is_ipv4() {
+    local ip=$1 i
+    local -a octets
+    [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    octets=("${BASH_REMATCH[@]:1}")
+    for i in "${octets[@]}"; do
+        (( 10#$i <= 255 )) || return 1
+    done
+    return 0
+}
+
+# Expands an IPv6 address into the four 32-bit words of the global array W.
+# Returns non-zero when the address is malformed.
+ipv6_words() {
+    local ip=$1 head tail fill i
+    local -a lh=() lt=() h=()
+    W=()
+
+    [[ $ip == *:* && $ip =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    # At most one "::" (it stands for a whole run of zero hextets), and no
+    # triple colon.
+    [[ $ip == *::*::* || $ip == :::* || $ip == *::: ]] && return 1
+
+    if [[ $ip == *::* ]]; then
+        head=${ip%%::*}
+        tail=${ip##*::}
+        [[ $head == *::* || $tail == *::* ]] && return 1
+    else
+        head=$ip
+        tail=""
+    fi
+    [[ -n $head ]] && IFS=: read -ra lh <<< "$head"
+    [[ -n $tail ]] && IFS=: read -ra lt <<< "$tail"
+
+    fill=$(( 8 - ${#lh[@]} - ${#lt[@]} ))
+    (( fill >= 0 )) || return 1
+    if [[ $ip != *::* ]] && (( fill != 0 )); then
+        return 1
+    fi
+
+    h=("${lh[@]}")
+    for (( i = 0; i < fill; i++ )); do h+=(0); done
+    h+=("${lt[@]}")
+    (( ${#h[@]} == 8 )) || return 1
+
+    for i in "${h[@]}"; do
+        [[ $i =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+    done
+
+    W=(
+        "$(( (16#${h[0]} << 16) | 16#${h[1]} ))"
+        "$(( (16#${h[2]} << 16) | 16#${h[3]} ))"
+        "$(( (16#${h[4]} << 16) | 16#${h[5]} ))"
+        "$(( (16#${h[6]} << 16) | 16#${h[7]} ))"
+    )
+    return 0
+}
+
+is_ipv6() {
+    ipv6_words "$1"
+}
+
+is_valid_address() {
+    is_ipv4 "$1" || is_ipv6 "$1"
+}
+
+ipv4_to_int() {
     local a b c d
     IFS='.' read -r a b c d <<< "$1"
-    echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+    printf '%s' $(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))
 }
 
-# Vérifie si une IP appartient à un sous-réseau CIDR
-ip_in_cidr() {
-    local ip="$1" cidr="$2"
-    if [[ "$cidr" != */* ]]; then
-        [[ "$ip" == "$cidr" ]] && return 0 || return 1
+ip_in_cidr_v4() {
+    local ip=$1 net prefix mask
+    if [[ $2 != */* ]]; then
+        [[ $ip == "$2" ]]
+        return
     fi
-    local net="${cidr%/*}"
-    local prefix="${cidr#*/}"
-    local ip_int net_int mask
-    ip_int=$(ip_to_int "$ip")
-    net_int=$(ip_to_int "$net")
-    mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
-    [[ $(( ip_int & mask )) -eq $(( net_int & mask )) ]] && return 0
-    return 1
+    net=${2%/*}
+    prefix=${2#*/}
+    [[ $prefix =~ ^[0-9]{1,2}$ ]] || return 1
+    (( prefix <= 32 )) || return 1
+    is_ipv4 "$ip" && is_ipv4 "$net" || return 1
+    if (( prefix == 0 )); then
+        mask=0
+    else
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    fi
+    (( ( $(ipv4_to_int "$ip") & mask ) == ( $(ipv4_to_int "$net") & mask ) ))
 }
 
-# Vérifie si une IP est dans la liste blanche
+ip_in_cidr_v6() {
+    local ip=$1 net prefix i full rem mask
+    local -a a b
+
+    if [[ $2 != */* ]]; then
+        ipv6_words "$ip" || return 1
+        a=("${W[@]}")
+        ipv6_words "$2" || return 1
+        b=("${W[@]}")
+        [[ ${a[*]} == "${b[*]}" ]]
+        return
+    fi
+    net=${2%/*}
+    prefix=${2#*/}
+    [[ $prefix =~ ^[0-9]{1,3}$ ]] || return 1
+    (( prefix <= 128 )) || return 1
+    ipv6_words "$ip" || return 1
+    a=("${W[@]}")
+    ipv6_words "$net" || return 1
+    b=("${W[@]}")
+
+    full=$(( prefix / 32 ))
+    rem=$(( prefix % 32 ))
+    for (( i = 0; i < 4; i++ )); do
+        if (( i < full )); then
+            mask=4294967295
+        elif (( i == full && rem > 0 )); then
+            mask=$(( (0xFFFFFFFF << (32 - rem)) & 0xFFFFFFFF ))
+        else
+            mask=0
+        fi
+        (( (a[i] & mask) == (b[i] & mask) )) || return 1
+    done
+    return 0
+}
+
+ip_in_cidr() {
+    if is_ipv4 "$1"; then
+        ip_in_cidr_v4 "$1" "$2"
+    else
+        ip_in_cidr_v6 "$1" "$2"
+    fi
+}
+
 is_whitelisted() {
-    local ip="$1"
+    local ip=$1 cidr
     for cidr in $WHITE_LIST; do
         ip_in_cidr "$ip" "$cidr" && return 0
     done
     return 1
 }
 
-# Initialise les tables et chaines nftables
-init_firewall() {
-    echo "Initialisation de nftables (Stratégie: $PORT_BLOCK)..."
-    # 'nft add table' : Crée la table principale de type 'inet' (gère IPv4 et IPv6)
-    nft add table inet $TABLE_NAME
-    # 'nft add set' : Crée l'ensemble d'IPs bannies avec support des intervalles et du délai d'expiration (timeout)
-    nft add set inet $TABLE_NAME $SET_NAME "{ type ipv4_addr; flags interval, timeout; }"
-    # 'nft add chain' : Crée la chaine de filtrage des entrées avec une priorité très haute (-100)
-    nft add chain inet $TABLE_NAME input "{ type filter hook input priority -100; policy accept; }"
-    
-    # 'nft flush chain' : Vide la chaine existante pour une réinitialisation propre des règles
-    nft flush chain inet $TABLE_NAME input
+# Prints the source address of one journald message, or nothing when the
+# message is not an SSH authentication failure. Field positions are not used:
+# sshd appends an optional method suffix ("ssh2: RSA SHA256:…"), which shifts
+# awk columns and used to make the daemon read the port as an address.
+extract_ip() {
+    local line=$1
+    [[ $line == *Failed\ password* || $line == *Failed\ publickey* \
+       || $line == *Failed\ keyboard-interactive* ]] || return 1
+    [[ $line =~ from\ ([0-9a-fA-F.:]+)\ port\ [0-9]+ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
 
-    # Ajout de la règle de drop selon la configuration (ports spécifiques ou global)
-    if [ "$PORT_BLOCK" = "all" ] || [ -z "$PORT_BLOCK" ]
-    then
-        # Bloque tout trafic provenant des IPs listées dans le set
-        nft add rule inet $TABLE_NAME input ip saddr "@$SET_NAME" drop
+# ---------------------------------------------------------------------------
+# nftables helpers
+# ---------------------------------------------------------------------------
+
+# The set an address belongs to, or failure when it is not a valid address.
+set_for_ip() {
+    if is_ipv4 "$1"; then
+        printf '%s' "$SET_V4"
+    elif is_ipv6 "$1"; then
+        printf '%s' "$SET_V6"
     else
-        # On remplace les virgules par des espaces pour le format nftables
-        local PORTS_NFT=$(echo $PORT_BLOCK | sed 's/,/, /g')
-        # Vérification sommaire que PORTS_NFT n'est pas vide pour éviter l'erreur de syntaxe { }
-        if [[ -n "$PORTS_NFT" ]]
-	then
-            # 'nft add rule' : Bloque uniquement les ports TCP/UDP spécifiés pour les IPs bannies
-            nft add rule inet $TABLE_NAME input ip saddr "@$SET_NAME" tcp dport "{ $PORTS_NFT }" drop
-            nft add rule inet $TABLE_NAME input ip saddr "@$SET_NAME" udp dport "{ $PORTS_NFT }" drop
-        else
-            nft add rule inet $TABLE_NAME input ip saddr "@$SET_NAME" drop
-        fi
+        return 1
     fi
-    echo "Configuration nftables prête."
 }
 
-# Restaure les bannissements actifs depuis les logs système au démarrage
-restore_bans() {
-    echo "Restauration des bans depuis le journal..."
-    # 'grep -oE' : Utilise une expression régulière pour extraire uniquement les adresses IPv4 valides des logs
-    local PREVIOUS_BANS=$(journalctl -t athena --since "-${BAN_TIME} seconds" --no-pager 2>/dev/null \
-        | grep -E "\[BAN\]|\[RESTORE\]" | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | sort -u)
-
-    for IP in $PREVIOUS_BANS; do
-        if is_whitelisted "$IP"; then continue; fi
-        
-        # On vérifie si l'événement le plus récent pour cette IP n'est pas un déban
-        local LAST_ACTION=$(journalctl -t athena --grep "$IP" -n 1 --no-pager 2>/dev/null)
-        if [[ "$LAST_ACTION" == *"[UNBAN]"* ]]; then continue; fi
-
-        # 'nft list set ... | grep -q' : Vérifie si l'IP est déjà présente dans le set nftables
-        if ! nft list set inet $TABLE_NAME $SET_NAME | grep -q "$IP"
-	then
-            logger -t athena "[RESTORE] $IP (temps restant estimé)"
-            # 'nft add element' : Réinsère l'IP dans le set avec son délai de bannissement
-            nft add element inet $TABLE_NAME $SET_NAME "{ $IP timeout ${BAN_TIME}s }"
-        fi
-    done
+# True when the address already is an element of the set. Uses the exact
+# element lookup: grepping `nft list set` matched 10.0.0.1 inside 10.0.0.10
+# and silently refused to ban legitimate offenders.
+set_contains() {
+    local set=$1 ip=$2
+    nft get element inet "$TABLE_NAME" "$set" "{ $ip }" >/dev/null 2>&1
 }
 
-# Lancement de la configuration initiale
-init_firewall
-restore_bans
+init_firewall() {
+    local -a ports=() sel=()
+    local p idx
 
-# Boucle principale de surveillance
-while true
-do
-    # 1. Traitement des demandes de débannissement manuel
-    if [ -s "$UNBAN_QUEUE" ]
-    then
-        while IFS= read -r IP_TO_UNBAN
-	do
-            if [[ -n "$IP_TO_UNBAN" ]]
-	    then
-                # 'nft delete element' : Supprime manuellement une IP du set de bannissement
-                if nft delete element inet $TABLE_NAME $SET_NAME "{ $IP_TO_UNBAN }" 2>/dev/null
-		then
-                    logger -t athena "[UNBAN] $IP_TO_UNBAN (Manuel)"
-                fi
+    log_event "[INFO] initialising nftables (port policy: $PORT_BLOCK)"
+    nft add table inet "$TABLE_NAME" 2>/dev/null || true
+    nft add set inet "$TABLE_NAME" "$SET_V4" \
+        "{ type ipv4_addr; flags interval, timeout; }" 2>/dev/null || true
+    nft add set inet "$TABLE_NAME" "$SET_V6" \
+        "{ type ipv6_addr; flags interval, timeout; }" 2>/dev/null || true
+    nft add chain inet "$TABLE_NAME" input \
+        "{ type filter hook input priority -100; policy accept; }" 2>/dev/null || true
+    nft flush chain inet "$TABLE_NAME" input 2>/dev/null || true
+
+    if [[ $PORT_BLOCK != all && -n $PORT_BLOCK ]]; then
+        local -a rawports=()
+        IFS=',' read -ra rawports <<< "$PORT_BLOCK"
+        for p in "${rawports[@]}"; do
+            p=${p// /}
+            [[ -z $p ]] && continue
+            if [[ ! $p =~ ^[0-9]+$ ]]; then
+                log_event "[WARN] ignoring invalid port '$p' in PORT_BLOCK"
+                continue
             fi
-        done < "$UNBAN_QUEUE"
-        > "$UNBAN_QUEUE"
+            ports+=("$p")
+        done
     fi
 
-    # 2. Détection des nouveaux échecs d'authentification SSH
-    # On ne lit que les logs des N dernières secondes
-    #  -t sshd-session au lieu de -u sshd car ça marche pas sur Debian
-    NEW_BANS=$(journalctl -t sshd-session --since "-${FIND_TIME} seconds" --no-pager \
-        | grep "Failed password" \
-        | awk '{print $(NF-3)}' \
-        | sort | uniq -c \
-        | awk -v limit="$THRESHOLD" '$1 >= limit {print $2}')
+    if (( ${#ports[@]} == 0 )); then
+        nft add rule inet "$TABLE_NAME" input ip saddr "@$SET_V4" drop
+        nft add rule inet "$TABLE_NAME" input ip6 saddr "@$SET_V6" drop
+    else
+        for idx in "${!ports[@]}"; do
+            (( idx > 0 )) && sel+=(",")
+            sel+=("${ports[idx]}")
+        done
+        nft add rule inet "$TABLE_NAME" input ip saddr "@$SET_V4" \
+            tcp dport "{" "${sel[@]}" "}" drop
+        nft add rule inet "$TABLE_NAME" input ip saddr "@$SET_V4" \
+            udp dport "{" "${sel[@]}" "}" drop
+        nft add rule inet "$TABLE_NAME" input ip6 saddr "@$SET_V6" \
+            tcp dport "{" "${sel[@]}" "}" drop
+        nft add rule inet "$TABLE_NAME" input ip6 saddr "@$SET_V6" \
+            udp dport "{" "${sel[@]}" "}" drop
+    fi
+    log_event "[INFO] nftables ready"
+}
 
-    for IP in $NEW_BANS
-    do
-        # Validation du format d'IP via une expression régulière (Regex)
-        if ! [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then continue; fi
-        if is_whitelisted "$IP"; then continue; fi
-        
-        # 'nft list set' : Vérifie la présence de l'IP avant ajout pour éviter les doublons
-        if ! nft list set inet $TABLE_NAME $SET_NAME | grep -q "$IP"
-	then
-            logger -t athena "[BAN] $IP (pour ${BAN_TIME}s)"
-            # 'nft add element' : Applique le bannissement réel dans le noyau via nftables
-            nft add element inet $TABLE_NAME $SET_NAME "{ $IP timeout ${BAN_TIME}s }"
-        fi
+ban_ip() {
+    local ip=$1 set
+    if ! set=$(set_for_ip "$ip"); then
+        return 1
+    fi
+    is_whitelisted "$ip" && return 1
+
+    # A manual unban wins over the failures still sitting in the window.
+    if [[ -n ${GRACE[$ip]:-} ]]; then
+        (( ${GRACE[$ip]} > $(now) )) && return 1
+        unset "GRACE[$ip]"
+    fi
+
+    set_contains "$set" "$ip" && return 0
+    # Log only once the kernel accepted the element: a failed `nft add` used
+    # to leave a [BAN] line for an address that was never blocked.
+    if nft add element inet "$TABLE_NAME" "$set" "{ $ip timeout ${BAN_TIME}s }" >/dev/null 2>&1; then
+        BANS[$ip]=$(( $(now) + BAN_TIME ))
+        STATE_DIRTY=1
+        log_event "[BAN] $ip (for ${BAN_TIME}s)"
+        return 0
+    fi
+    log_event "[WARN] failed to ban $ip"
+    return 1
+}
+
+unban_ip() {
+    local ip=$1 set
+    if ! set=$(set_for_ip "$ip"); then
+        log_event "[UNBAN] $ip (unsupported address family)"
+        return 1
+    fi
+    if ! is_valid_address "$ip"; then
+        log_event "[UNBAN] $ip (invalid address, ignored)"
+        return 1
+    fi
+
+    # Whatever the outcome, the address is spared for a full finding window:
+    # the failures that caused the ban are still in the journal, and the next
+    # scan would ban it again a few seconds later.
+    unset "BANS[$ip]"
+    GRACE[$ip]=$(( $(now) + FIND_TIME ))
+    STATE_DIRTY=1
+
+    if nft delete element inet "$TABLE_NAME" "$set" "{ $ip }" >/dev/null 2>&1; then
+        log_event "[UNBAN] $ip (Manual)"
+        return 0
+    fi
+    log_event "[UNBAN] $ip (was not banned, ignored for ${FIND_TIME}s)"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Failure counting
+#
+# The daemon used to re-read the last FIND_TIME seconds of journal on every
+# cycle: journalctl then costs ~6 ms per cycle, whatever `--since` or
+# `--after-cursor` is used, because opening the journal dominates. Instead the
+# journal is followed once on a dedicated descriptor and the failures are
+# counted in memory, so an idle daemon costs nothing and only an actual
+# failure costs a `grep`-free function call.
+# ---------------------------------------------------------------------------
+
+is_ssh_failure() {
+    local line=$1
+    [[ $line == *Failed\ password* || $line == *Failed\ publickey* \
+       || $line == *Failed\ keyboard-interactive* ]]
+}
+
+# Records one failure for the address it comes from and bans it as soon as
+# THRESHOLD failures fall inside the finding window.
+record_failure() {
+    local line=$1 ip ts t
+    local -a times=() kept=()
+
+    is_ssh_failure "$line" || return 1
+    ip=$(extract_ip "$line") || return 1
+    is_whitelisted "$ip" && return 1
+    [[ -n ${BANS[$ip]:-} ]] && return 1
+    if [[ -n ${GRACE[$ip]:-} ]] && (( ${GRACE[$ip]} > $(now) )); then
+        return 1
+    fi
+
+    ts=$(now)
+    IFS=' ' read -ra times <<< "${FAILS[$ip]:-}"
+    for t in "${times[@]}"; do
+        (( ts - t < FIND_TIME )) && kept+=("$t")
+    done
+    kept+=("$ts")
+    # Only the last THRESHOLD timestamps matter: an older one cannot trigger a
+    # ban, and keeping every attempt of a flood would grow without bound.
+    while (( ${#kept[@]} > THRESHOLD )); do
+        kept=("${kept[@]:1}")
     done
 
-    # Attente avant la prochaine vérification
-    sleep "$CHECK_INTERVAL"
-done
+    if (( ${#kept[@]} >= THRESHOLD )) && ban_ip "$ip"; then
+        unset "FAILS[$ip]"
+        return 0
+    fi
+    FAILS[$ip]="${kept[*]}"
+    return 1
+}
+
+# Replays the finding window once at startup, so a restart does not blind the
+# daemon for FIND_TIME. The journal is read with -o cat, which drops the
+# timestamp: those attempts are counted as if they had just happened.
+seed_window() {
+    local line
+    local -a args=(journalctl -q --no-pager -o cat --since "-${FIND_TIME} seconds")
+    journal_match_args
+    args+=("${JMATCH[@]}")
+    while IFS= read -r line; do
+        record_failure "$line"
+    done < <("${args[@]}" 2>/dev/null)
+}
+
+start_stream() {
+    journal_match_args
+    exec {STREAM_FD}< <(journalctl -q -f -n 0 -o cat "${JMATCH[@]}" 2>/dev/null)
+}
+
+stop_stream() {
+    [[ -n $STREAM_FD ]] || return 0
+    exec {STREAM_FD}>&-
+    STREAM_FD=""
+}
+
+process_unban_queue() {
+    local queue=$RUN_DIR/unban_queue staging=$RUN_DIR/unban_queue.processing
+    local lock=$RUN_DIR/unban_queue.lock fd ip
+    [[ -s $queue ]] || return 0
+
+    # The client appends under the same lock; the pending requests are moved
+    # out of the way in one rename, so a request written between the read and
+    # the truncation can no longer be lost.
+    exec {fd}>>"$lock" || return 0
+    if ! flock -x "$fd"; then
+        exec {fd}>&-
+        return 0
+    fi
+    if ! mv -f "$queue" "$staging" 2>/dev/null; then
+        flock -u "$fd"
+        exec {fd}>&-
+        return 0
+    fi
+    : > "$queue"
+    flock -u "$fd"
+    exec {fd}>&-
+
+    while IFS= read -r ip; do
+        [[ -n $ip ]] || continue
+        unban_ip "$ip"
+    done < "$staging"
+    rm -f "$staging"
+}
+
+# ---------------------------------------------------------------------------
+# Ban state
+#
+# The kernel keeps the timeout of every element, but not across a reboot and
+# not across a `nft flush ruleset` run by another tool. The daemon therefore
+# records each ban with its absolute expiry in $STATE_FILE and restores the
+# exact remaining time, instead of re-reading its own journal and handing out
+# a fresh BAN_TIME to every address it finds there.
+# ---------------------------------------------------------------------------
+
+state_load() {
+    local ip expiry
+    BANS=()
+    [[ -r $STATE_FILE ]] || return 1
+    while IFS=' ' read -r ip expiry; do
+        [[ -n $ip && -n $expiry ]] || continue
+        is_valid_address "$ip" || continue
+        [[ $expiry =~ ^[0-9]+$ ]] || continue
+        BANS[$ip]=$expiry
+    done < "$STATE_FILE"
+    return 0
+}
+
+state_save() {
+    local tmp=$STATE_FILE.tmp.$$ ip
+    if ! : > "$tmp"; then
+        return 1
+    fi
+    for ip in "${!BANS[@]}"; do
+        printf '%s %s\n' "$ip" "${BANS[$ip]}" >> "$tmp"
+    done
+    if mv -f "$tmp" "$STATE_FILE"; then
+        STATE_DIRTY=0
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# Forgets the failures that left the finding window. Without it the table
+# grows with every address that failed once — a scan from a /16 would keep
+# 65k entries for the lifetime of the daemon. The work is amortised: the table
+# is only walked once every FIND_TIME/10 at most.
+prune_failures() {
+    local ip n t kept
+    local -a timestamps=()
+    n=$(now)
+    (( n >= NEXT_FAIL_PRUNE )) || return 0
+    NEXT_FAIL_PRUNE=$(( n + (FIND_TIME / 10 > 1 ? FIND_TIME / 10 : 1) ))
+    for ip in "${!FAILS[@]}"; do
+        timestamps=()
+        IFS=' ' read -ra timestamps <<< "${FAILS[$ip]}"
+        kept=()
+        for t in "${timestamps[@]}"; do
+            (( n - t < FIND_TIME )) && kept+=("$t")
+        done
+        if (( ${#kept[@]} == 0 )); then
+            unset "FAILS[$ip]"
+        else
+            FAILS[$ip]="${kept[*]}"
+        fi
+    done
+}
+
+# Drops the records the kernel has already expired, and the grace periods
+# that are over. No nft call: the expiry recorded at ban time is the timeout
+# handed to the kernel, so both end together.
+prune_state() {
+    local ip n
+    n=$(now)
+    for ip in "${!GRACE[@]}"; do
+        (( ${GRACE[$ip]} <= n )) && unset "GRACE[$ip]"
+    done
+    for ip in "${!BANS[@]}"; do
+        if (( ${BANS[$ip]} <= n )); then
+            unset "BANS[$ip]"
+            STATE_DIRTY=1
+        fi
+    done
+    prune_failures
+}
+
+restore_bans() {
+    local ip expiry remaining set
+
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    chmod 700 "$STATE_DIR" 2>/dev/null
+
+    if state_load; then
+        log_event "[INFO] restoring bans from $STATE_FILE"
+        for ip in "${!BANS[@]}"; do
+            expiry=${BANS[$ip]}
+            remaining=$(( expiry - $(now) ))
+            if (( remaining <= 0 )); then
+                unset "BANS[$ip]"
+                STATE_DIRTY=1
+                continue
+            fi
+            if ! set=$(set_for_ip "$ip"); then
+                unset "BANS[$ip]"
+                STATE_DIRTY=1
+                continue
+            fi
+            set_contains "$set" "$ip" && continue
+            if nft add element inet "$TABLE_NAME" "$set" "{ $ip timeout ${remaining}s }" >/dev/null 2>&1; then
+                log_event "[RESTORE] $ip (${remaining}s remaining)"
+            else
+                log_event "[WARN] failed to restore $ip"
+            fi
+        done
+        (( STATE_DIRTY )) && state_save
+        return 0
+    fi
+
+    # First start of this version: no state file yet, rebuild from the journal.
+    log_event "[INFO] no state file yet, rebuilding bans from the journal"
+    restore_bans_from_journal
+}
+
+restore_bans_from_journal() {
+    local ip last_action set
+    while IFS= read -r ip; do
+        [[ -n $ip ]] || continue
+        is_whitelisted "$ip" && continue
+        set=$(set_for_ip "$ip") || continue
+        # Skip addresses whose most recent event was a manual unban.
+        last_action=$(journalctl -q -t athena --grep "$ip" -n 1 --no-pager 2>/dev/null)
+        [[ $last_action == *"[UNBAN]"* ]] && continue
+        if ! set_contains "$set" "$ip"; then
+            if nft add element inet "$TABLE_NAME" "$set" "{ $ip timeout ${BAN_TIME}s }" >/dev/null 2>&1; then
+                log_event "[RESTORE] $ip (estimated remaining time)"
+            fi
+        fi
+    done < <(journalctl -q -t athena --since "-${BAN_TIME} seconds" --no-pager 2>/dev/null \
+             | grep -E '\[BAN\]|\[RESTORE\]' \
+             | sed -nE 's/.*\[(BAN|RESTORE)\] ([0-9a-fA-F.:]+).*/\2/p' | sort -u)
+}
+
+# Everything that has to happen between two journal scans.
+housekeeping() {
+    process_unban_queue
+    prune_state
+    if (( STATE_DIRTY )); then
+        state_save || log_event "[WARN] cannot write $STATE_FILE"
+    fi
+}
+
+validate_config() {
+    local v rc=0
+    for v in THRESHOLD BAN_TIME FIND_TIME CHECK_INTERVAL; do
+        if [[ ! ${!v} =~ ^[0-9]+$ ]]; then
+            log_event "[ERROR] $v must be a positive integer (got '${!v}')"
+            rc=1
+        fi
+    done
+    (( THRESHOLD >= 1 )) || { log_event "[ERROR] THRESHOLD must be >= 1"; rc=1; }
+    (( CHECK_INTERVAL >= 1 )) || { log_event "[ERROR] CHECK_INTERVAL must be >= 1"; rc=1; }
+    if (( BAN_TIME < FIND_TIME )); then
+        log_event "[WARN] BAN_TIME (${BAN_TIME}s) < FIND_TIME (${FIND_TIME}s): an address can be re-banned from stale log lines and stay blocked permanently"
+    fi
+    return "$rc"
+}
+
+load_config() {
+    if [[ -r $CONF_FILE ]]; then
+        # shellcheck source=/dev/null
+        source "$CONF_FILE"
+    elif [[ -r $FALLBACK_CONF ]]; then
+        # shellcheck source=/dev/null
+        source "$FALLBACK_CONF"
+    else
+        log_event "[ERROR] no configuration file found ($CONF_FILE, $FALLBACK_CONF)"
+        return 1
+    fi
+}
+
+main() {
+    local opt ip
+    for opt in "$@"; do
+        case $opt in
+            -v|--version) printf 'Athena Server Version %s\n' "$(athena_version)"; return 0 ;;
+            -h|--help) printf 'Usage: athena-server [--version]\n'; return 0 ;;
+        esac
+    done
+
+    if (( EUID != 0 )); then
+        printf 'Erreur : ce script doit être exécuté en root.\n' >&2
+        return 1
+    fi
+
+    load_config || return 1
+    validate_config || return 1
+
+    if ! command -v nft >/dev/null 2>&1; then
+        log_event "[ERROR] nft not found in PATH"
+        return 1
+    fi
+    if ! command -v journalctl >/dev/null 2>&1; then
+        log_event "[ERROR] journalctl not found: Athena needs systemd-journald"
+        return 1
+    fi
+
+    mkdir -p "$RUN_DIR"
+    chmod 755 "$RUN_DIR"
+    : >> "$RUN_DIR/unban_queue"
+    chmod 644 "$RUN_DIR/unban_queue"
+
+    log_event "[INFO] Athena Server started (version $(athena_version), backend: nftables)"
+    init_firewall
+    restore_bans
+
+    trap 'stop_stream; (( STATE_DIRTY )) && state_save; log_event "[INFO] Athena Server stopping"; exit 0' TERM INT
+
+    seed_window
+    start_stream
+    log_event "[INFO] watching sshd failures (identifiers: $SSH_LOG_TAGS)"
+
+    local line rc last_house
+    last_house=$(now)
+    while :; do
+        # Read one journal entry, or wake up after CHECK_INTERVAL to run the
+        # housekeeping: no journalctl call, and therefore no fork, per cycle.
+        if IFS= read -r -t "$CHECK_INTERVAL" -u "$STREAM_FD" line; then
+            record_failure "$line"
+            line=""
+        else
+            rc=$?
+            if (( rc > 128 )); then
+                # Timed out: nothing happened. A partial line is still worth
+                # parsing, the address is always at the beginning.
+                if [[ -n $line ]]; then
+                    record_failure "$line"
+                    line=""
+                fi
+            else
+                # EOF: journalctl exited (journal rotation, restart, or it was
+                # killed). Reconnect and re-seed so no attempt is missed.
+                log_event "[WARN] journal stream ended, reconnecting"
+                sleep 1
+                stop_stream
+                start_stream
+                seed_window
+            fi
+        fi
+        if (( $(now) - last_house >= CHECK_INTERVAL )); then
+            housekeeping
+            last_house=$(now)
+        fi
+    done
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

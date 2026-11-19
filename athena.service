@@ -1,14 +1,32 @@
 [Unit]
-Description=Athena Security Daemon
+Description=Athena Security Daemon (SSH brute-force blocker)
+Documentation=https://github.com/aaaaadrien/athena
 After=network.target
 Requires=systemd-journald.service
 
 [Service]
 Type=simple
 User=root
+ExecStartPre=/bin/sh -c 'command -v nft >/dev/null || { echo "athena: nft not found" >&2; exit 1; }'
 ExecStart=/usr/bin/athena-server
 Restart=on-failure
 RestartSec=5s
+
+# /run/athena holds the unban request queue, /var/lib/athena the ban state.
+RuntimeDirectory=athena
+RuntimeDirectoryMode=0755
+StateDirectory=athena
+StateDirectoryMode=0700
+
+# The daemon only needs the journal and nftables: it never writes anywhere
+# else and never executes a helper of its own.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+ReadWritePaths=/run/athena /var/lib/athena
 
 [Install]
 WantedBy=multi-user.target

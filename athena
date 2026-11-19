@@ -1,76 +1,203 @@
 #!/usr/bin/env bash
-VERSION="1.0"
+#
+# athena — command line client for the Athena SSH blocker.
+# Part of Athena. Licensed under GPL-3.0.
 
-# 0. Vérification options
-case "$1" in
-    -v|--version)
-        echo "Athena Server Version $VERSION"
-        exit 0
-        ;;
-esac
+PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/local/sbin:/usr/sbin:/sbin"
+export PATH
 
-# 1. Vérification des privilèges root
-if [[ $EUID -ne 0 ]]
-then
-    echo "Erreur : ce script doit être exécuté en root." >&2
-    exit 1
-fi
+TABLE_NAME=athena
+SET_V4=athena_blacklist
+SET_V6=athena_blacklist6
 
-# 2. Chargement de la configuration
-if [ -f "/etc/athena/athena.conf" ]
-then
-    source /etc/athena/athena.conf
-elif [ -f "./athena.conf" ]
-then
-    source ./athena.conf
-else
-    echo "Erreur : Fichier athena.conf introuvable." >&2
-    exit 1
-fi
+VERSION_FILE=${ATHENA_VERSION_FILE:-/usr/share/athena/VERSION}
+RUN_DIR=${ATHENA_RUN_DIR:-/run/athena}
+UNBAN_QUEUE=$RUN_DIR/unban_queue
 
-# Définition des constantes nftables
-SET_NAME="athena_blacklist"
-TABLE_NAME="athena"
-
-# Fonction d'affichage de l'aide
-usage() {
-    echo "Usage: athena [-l] [-u IP]"
-    echo "  -l      Lister les IPs bannies et leur temps restant"
-    echo "  -u IP   Débannir manuellement une IP"
-    exit 1
+athena_version() {
+    local vf=$VERSION_FILE v=""
+    if [[ ! -r $vf && -n ${BASH_SOURCE[0]:-} ]]; then
+        vf="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/VERSION"
+    fi
+    [[ -r $vf ]] && IFS= read -r v < "$vf"
+    printf '%s\n' "${v:-dev}"
 }
 
-# Vérification de la présence d'arguments
-if [ $# -eq 0 ]; then usage; fi
+is_ipv4() {
+    local ip=$1 i
+    local -a octets
+    [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    octets=("${BASH_REMATCH[@]:1}")
+    for i in "${octets[@]}"; do
+        (( 10#$i <= 255 )) || return 1
+    done
+    return 0
+}
 
-# Traitement des options de ligne de commande
-while getopts "lu:" opt
-do
-    case $opt in
-        l)
-            echo "--- Liste des IPs bannies (Athena) ---"
-            # 1. 'nft list set' : Récupère le contenu du set de bannissement
-            # 2. 'grep expires' : Filtre pour ne garder que les entrées actives avec expiration
-            # 3. 'sed -E' : Utilise des expressions régulières pour formater l'affichage (nettoyage espaces, ajout parenthèses)
-            nft list set inet $TABLE_NAME $SET_NAME 2>/dev/null | grep 'expires' | sed -E 's/^[[:space:]]+//; s/ expires/ (temps restant :/; s/,? \}$//; s/$/)/' || echo "Aucune IP bannie."
-            exit 0
-            ;;
-        u)
-            IP="$OPTARG"
-            UNBAN_QUEUE="/run/athena/unban_queue"
-            # Envoi de l'IP à la file d'attente de débannissement
-            if [ -d "/run/athena" ]
-	    then
-                echo "$IP" >> "$UNBAN_QUEUE"
-                echo "Demande de débannissement pour $IP envoyée au serveur (traitement sous 5s)."
+# Loose IPv6 check: enough to reject typos before they reach nft.
+is_ipv6() {
+    local ip=$1
+    [[ $ip == *:* ]] || return 1
+    [[ $ip =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    [[ $ip == *::*::* || $ip == :::* || $ip == *::: ]] && return 1
+    return 0
+}
+
+is_valid_address() {
+    is_ipv4 "$1" || is_ipv6 "$1"
+}
+
+set_for_ip() {
+    if is_ipv4 "$1"; then
+        printf '%s' "$SET_V4"
+    elif is_ipv6 "$1"; then
+        printf '%s' "$SET_V6"
+    else
+        return 1
+    fi
+}
+
+# Converts an nftables duration ("1h2m", "59m59s", "45s998ms") to seconds.
+duration_to_seconds() {
+    local d=$1 total=0 num unit
+    while [[ $d =~ ^([0-9]+)([dhmsu]+)(.*)$ ]]; do
+        num=${BASH_REMATCH[1]}
+        unit=${BASH_REMATCH[2]}
+        d=${BASH_REMATCH[3]}
+        case $unit in
+            d) total=$(( total + num * 86400 )) ;;
+            h) total=$(( total + num * 3600 )) ;;
+            m) total=$(( total + num * 60 )) ;;
+            s) total=$(( total + num )) ;;
+            ms|us) : ;;   # sub-second precision is irrelevant here
+            *) return 1 ;;
+        esac
+    done
+    [[ -z $d ]] || return 1
+    printf '%s' "$total"
+}
+
+human_duration() {
+    local s=$1
+    if (( s >= 3600 )); then
+        printf '%dh%02dm%02ds' $(( s / 3600 )) $(( (s % 3600) / 60 )) $(( s % 60 ))
+    elif (( s >= 60 )); then
+        printf '%dm%02ds' $(( s / 60 )) $(( s % 60 ))
+    else
+        printf '%ds' "$s"
+    fi
+}
+
+usage() {
+    cat <<'USAGE'
+Usage: athena [-l] [-u IP] [-v]
+
+  -l        Lister les adresses bannies et leur temps restant
+  -u IP     Débannir manuellement une adresse
+  -v        Afficher la version
+USAGE
+}
+
+# Prints "<<ip>> <<remaining seconds>>" for every element of a set. The nft
+# listing puts all elements on one long line, so it is split on the commas
+# between elements; the optional "the time and expires" parts are ignored.
+set_elements() {
+    local set=$1 raw line ip expires
+    raw=$(nft list set inet "$TABLE_NAME" "$set" 2>/dev/null) || return 1
+    [[ -n $raw ]] || return 1
+    # `|| [[ -n $line ]]`: the last element has no trailing newline, and a
+    # plain `while read` would silently drop it.
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line#"${line%%[![:space:]]*}"}
+        ip=${line%% *}
+        [[ -n $ip ]] || continue
+        expires=""
+        if [[ $line =~ expires[[:space:]]+([0-9dhmsu]+) ]]; then
+            expires=${BASH_REMATCH[1]}
+        fi
+        printf '%s %s\n' "$ip" "${expires:--}"
+    done < <(printf '%s\n' "$raw" | tr -d '\n\t' \
+             | sed -E 's/^.*elements[[:space:]]*=[[:space:]]*\{//; s/[{}[:space:]]*$//' \
+             | tr ',' '\n')
+}
+
+list_bans() {
+    local found=0 ip rem secs set
+    echo "--- Athena : adresses bannies ---"
+    for set in "$SET_V4" "$SET_V6"; do
+        while IFS=' ' read -r ip rem || [[ -n $ip ]]; do
+            [[ -n $ip ]] || continue
+            found=$(( found + 1 ))
+            if [[ $rem == - ]]; then
+                printf '  %-39s %s\n' "$ip" "sans expiration"
             else
-                echo "Erreur : Le dossier /run/athena n'existe pas. Le serveur Athena est-il lancé ?"
-                exit 1
+                secs=$(duration_to_seconds "$rem") || secs=0
+                printf '  %-39s %s\n' "$ip" "$(human_duration "$secs")"
             fi
-            exit 0
-            ;;
-        *)
-            usage
-            ;;
-    esac
-done
+        done < <(set_elements "$set")
+    done
+    if (( found == 0 )); then
+        echo "Aucune adresse bannie."
+    else
+        echo "Total : $found adresse(s) bannie(s)."
+    fi
+}
+
+unban() {
+    local ip=$1 set fd
+    if ! is_valid_address "$ip"; then
+        echo "Erreur : adresse IP invalide : '$ip'." >&2
+        return 1
+    fi
+    if [[ ! -d $RUN_DIR ]]; then
+        echo "Erreur : $RUN_DIR n'existe pas. Le serveur Athena est-il démarré ?" >&2
+        return 1
+    fi
+    set=$(set_for_ip "$ip") || return 1
+    if ! nft get element inet "$TABLE_NAME" "$set" "{ $ip }" >/dev/null 2>&1; then
+        echo "$ip n'est pas bannie."
+        return 2
+    fi
+    # Same lock as the daemon: the request must not be appended while the
+    # server is rotating the queue.
+    exec {fd}>>"$UNBAN_QUEUE.lock" || return 1
+    if flock -x "$fd" && printf '%s\n' "$ip" >> "$UNBAN_QUEUE"; then
+        flock -u "$fd"
+        exec {fd}>&-
+        echo "Demande de débannissement pour $ip transmise au serveur (traitement dans la seconde)."
+        return 0
+    fi
+    flock -u "$fd" 2>/dev/null
+    exec {fd}>&-
+    echo "Erreur : impossible d'écrire dans $UNBAN_QUEUE." >&2
+    return 1
+}
+
+main() {
+    local opt ip
+    if (( $# == 0 )); then
+        usage
+        return 1
+    fi
+    while getopts "lu:vh" opt; do
+        case $opt in
+            l) list_bans; return 0 ;;
+            u) ip=$OPTARG
+               if (( EUID != 0 )); then
+                   echo "Erreur : cette commande doit être exécutée en root." >&2
+                   return 1
+               fi
+               unban "$ip"
+               return $?
+               ;;
+            v) printf 'Athena Client Version %s\n' "$(athena_version)"; return 0 ;;
+            *) usage; return 1 ;;
+        esac
+    done
+    usage
+    return 1
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
