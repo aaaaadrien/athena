@@ -18,6 +18,14 @@ CONF_FILE=${ATHENA_CONF:-/etc/athena/athena.conf}
 FALLBACK_CONF=${ATHENA_FALLBACK_CONF:-./athena.conf}
 VERSION_FILE=${ATHENA_VERSION_FILE:-/usr/share/athena/VERSION}
 RUN_DIR=${ATHENA_RUN_DIR:-/run/athena}
+STATE_DIR=${ATHENA_STATE_DIR:-/var/lib/athena}
+STATE_FILE=$STATE_DIR/bans
+
+# ip -> absolute expiry (epoch) of its ban, persisted across restarts.
+# ip -> epoch until which a manually unbanned address is left alone.
+declare -A BANS=()
+declare -A GRACE=()
+STATE_DIRTY=0
 
 # Defaults; each of these can be overridden from athena.conf.
 THRESHOLD=${THRESHOLD:-2}
@@ -125,6 +133,10 @@ ipv6_words() {
 
 is_ipv6() {
     ipv6_words "$1"
+}
+
+is_valid_address() {
+    is_ipv4 "$1" || is_ipv6 "$1"
 }
 
 ipv4_to_int() {
@@ -283,10 +295,19 @@ ban_ip() {
         return 1
     fi
     is_whitelisted "$ip" && return 1
+
+    # A manual unban wins over the failures still sitting in the window.
+    if [[ -n ${GRACE[$ip]:-} ]]; then
+        (( ${GRACE[$ip]} > $(now) )) && return 1
+        unset "GRACE[$ip]"
+    fi
+
     set_contains "$set" "$ip" && return 0
     # Log only once the kernel accepted the element: a failed `nft add` used
     # to leave a [BAN] line for an address that was never blocked.
     if nft add element inet "$TABLE_NAME" "$set" "{ $ip timeout ${BAN_TIME}s }" >/dev/null 2>&1; then
+        BANS[$ip]=$(( $(now) + BAN_TIME ))
+        STATE_DIRTY=1
         log_event "[BAN] $ip (for ${BAN_TIME}s)"
         return 0
     fi
@@ -300,11 +321,23 @@ unban_ip() {
         log_event "[UNBAN] $ip (unsupported address family)"
         return 1
     fi
+    if ! is_valid_address "$ip"; then
+        log_event "[UNBAN] $ip (invalid address, ignored)"
+        return 1
+    fi
+
+    # Whatever the outcome, the address is spared for a full finding window:
+    # the failures that caused the ban are still in the journal, and the next
+    # scan would ban it again a few seconds later.
+    unset "BANS[$ip]"
+    GRACE[$ip]=$(( $(now) + FIND_TIME ))
+    STATE_DIRTY=1
+
     if nft delete element inet "$TABLE_NAME" "$set" "{ $ip }" >/dev/null 2>&1; then
         log_event "[UNBAN] $ip (Manual)"
         return 0
     fi
-    log_event "[UNBAN] $ip (not banned)"
+    log_event "[UNBAN] $ip (was not banned, ignored for ${FIND_TIME}s)"
     return 1
 }
 
@@ -321,18 +354,124 @@ failed_sources() {
 }
 
 process_unban_queue() {
-    local queue=$RUN_DIR/unban_queue ip
+    local queue=$RUN_DIR/unban_queue staging=$RUN_DIR/unban_queue.processing
+    local lock=$RUN_DIR/unban_queue.lock fd ip
     [[ -s $queue ]] || return 0
+
+    # The client appends under the same lock; the pending requests are moved
+    # out of the way in one rename, so a request written between the read and
+    # the truncation can no longer be lost.
+    exec {fd}>>"$lock" || return 0
+    if ! flock -x "$fd"; then
+        exec {fd}>&-
+        return 0
+    fi
+    if ! mv -f "$queue" "$staging" 2>/dev/null; then
+        flock -u "$fd"
+        exec {fd}>&-
+        return 0
+    fi
+    : > "$queue"
+    flock -u "$fd"
+    exec {fd}>&-
+
     while IFS= read -r ip; do
         [[ -n $ip ]] || continue
         unban_ip "$ip"
-    done < "$queue"
-    : > "$queue"
+    done < "$staging"
+    rm -f "$staging"
+}
+
+# ---------------------------------------------------------------------------
+# Ban state
+#
+# The kernel keeps the timeout of every element, but not across a reboot and
+# not across a `nft flush ruleset` run by another tool. The daemon therefore
+# records each ban with its absolute expiry in $STATE_FILE and restores the
+# exact remaining time, instead of re-reading its own journal and handing out
+# a fresh BAN_TIME to every address it finds there.
+# ---------------------------------------------------------------------------
+
+state_load() {
+    local ip expiry
+    BANS=()
+    [[ -r $STATE_FILE ]] || return 1
+    while IFS=' ' read -r ip expiry; do
+        [[ -n $ip && -n $expiry ]] || continue
+        is_valid_address "$ip" || continue
+        [[ $expiry =~ ^[0-9]+$ ]] || continue
+        BANS[$ip]=$expiry
+    done < "$STATE_FILE"
+    return 0
+}
+
+state_save() {
+    local tmp=$STATE_FILE.tmp.$$ ip
+    if ! : > "$tmp"; then
+        return 1
+    fi
+    for ip in "${!BANS[@]}"; do
+        printf '%s %s\n' "$ip" "${BANS[$ip]}" >> "$tmp"
+    done
+    if mv -f "$tmp" "$STATE_FILE"; then
+        STATE_DIRTY=0
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# Drops the records the kernel has already expired, and the grace periods
+# that are over. No nft call: the expiry recorded at ban time is the timeout
+# handed to the kernel, so both end together.
+prune_state() {
+    local ip n
+    n=$(now)
+    for ip in "${!GRACE[@]}"; do
+        (( ${GRACE[$ip]} <= n )) && unset "GRACE[$ip]"
+    done
+    for ip in "${!BANS[@]}"; do
+        if (( ${BANS[$ip]} <= n )); then
+            unset "BANS[$ip]"
+            STATE_DIRTY=1
+        fi
+    done
 }
 
 restore_bans() {
+    local ip expiry remaining
+
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    chmod 700 "$STATE_DIR" 2>/dev/null
+
+    if state_load; then
+        log_event "[INFO] restoring bans from $STATE_FILE"
+        for ip in "${!BANS[@]}"; do
+            expiry=${BANS[$ip]}
+            remaining=$(( expiry - $(now) ))
+            if (( remaining <= 0 )); then
+                unset "BANS[$ip]"
+                STATE_DIRTY=1
+                continue
+            fi
+            set_contains "$SET_V4" "$ip" && continue
+            if nft add element inet "$TABLE_NAME" "$SET_V4" "{ $ip timeout ${remaining}s }" >/dev/null 2>&1; then
+                log_event "[RESTORE] $ip (${remaining}s remaining)"
+            else
+                log_event "[WARN] failed to restore $ip"
+            fi
+        done
+        (( STATE_DIRTY )) && state_save
+        return 0
+    fi
+
+    # First start of this version: no state file yet, rebuild from the journal.
+    log_event "[INFO] no state file yet, rebuilding bans from the journal"
+    restore_bans_from_journal
+}
+
+restore_bans_from_journal() {
     local ip last_action
-    log_event "[INFO] restoring bans from the journal"
     while IFS= read -r ip; do
         [[ -n $ip ]] || continue
         is_whitelisted "$ip" && continue
@@ -347,6 +486,15 @@ restore_bans() {
     done < <(journalctl -q -t athena --since "-${BAN_TIME} seconds" --no-pager 2>/dev/null \
              | grep -E '\[BAN\]|\[RESTORE\]' \
              | sed -nE 's/.*\[(BAN|RESTORE)\] ([0-9a-fA-F.:]+).*/\2/p' | sort -u)
+}
+
+# Everything that has to happen between two journal scans.
+housekeeping() {
+    process_unban_queue
+    prune_state
+    if (( STATE_DIRTY )); then
+        state_save || log_event "[WARN] cannot write $STATE_FILE"
+    fi
 }
 
 validate_config() {
@@ -413,9 +561,9 @@ main() {
     init_firewall
     restore_bans
 
-    trap 'log_event "[INFO] Athena Server stopping"; exit 0' TERM INT
+    trap '(( STATE_DIRTY )) && state_save; log_event "[INFO] Athena Server stopping"; exit 0' TERM INT
     while :; do
-        process_unban_queue
+        housekeeping
         while IFS= read -r ip; do
             [[ -n $ip ]] || continue
             ban_ip "$ip"

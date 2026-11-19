@@ -172,10 +172,6 @@ wait_for 5 banned 203.0.113.8 && pass "ban with method suffix" || fail "ban with
 if grep -q '203.0.113.5' "$work/list.out"; then pass "athena -l lists banned ip"; else fail "athena -l lists banned ip"; fi
 if grep -qi 'aucun\|no ban' "$work/list.out"; then fail "athena -l must not claim the set is empty"; else pass "athena -l reports a non-empty set"; fi
 
-# The source log is cleared first: without a grace period (see the
-# "manual unban is honoured" scenario) the daemon would re-ban immediately
-# from the log lines still inside the finding window.
-: > "$work/ssh.log"
 ( cd "$work" && "$repo/athena" -u 203.0.113.5 ) > "$work/unban.out" 2>&1
 wait_for 5 bash -c "! nft get element inet athena athena_blacklist '{ 203.0.113.5 }' >/dev/null 2>&1" \
     && pass "athena -u removes the address" || fail "athena -u removes the address"
@@ -187,6 +183,54 @@ grep -qi 'not banned\|pas banni' "$work/unban2.out" && pass "athena -u on a clea
 ( cd "$work" && "$repo/athena" -u "not-an-ip" ) > "$work/unban3.out" 2>&1
 grep -qiE 'invalid|invalide' "$work/unban3.out" && pass "athena -u rejects garbage" \
     || fail "athena -u rejects garbage"
+
+# --- scenario: a manual unban is not undone by the next scan -------------
+sshd_line 198.51.100.20 >> "$work/ssh.log"
+sshd_line 198.51.100.20 >> "$work/ssh.log"
+wait_for 5 banned 198.51.100.20 && pass "offender banned before unban" || fail "offender banned before unban"
+( cd "$work" && "$repo/athena" -u 198.51.100.20 ) > /dev/null 2>&1
+wait_for 5 bash -c "! nft get element inet athena athena_blacklist '{ 198.51.100.20 }' >/dev/null 2>&1" \
+    && pass "unban applied" || fail "unban applied"
+# The two failures are still inside FIND_TIME: without the grace period the
+# next scan bans the address again within CHECK_INTERVAL.
+sleep 3
+if banned 198.51.100.20; then
+    fail "manual unban is reverted by the next scan"
+else
+    pass "manual unban survives the finding window"
+fi
+
+# --- scenario: bans are recorded with an absolute expiry -----------------
+state_line=$(grep '^203\.0\.113\.8 ' "$work/state/bans" 2>/dev/null)
+if [[ -n $state_line ]]; then pass "ban recorded in the state file"; else fail "ban recorded in the state file"; fi
+state_expiry=${state_line##* }
+if (( state_expiry > $(date +%s) )); then pass "state expiry is in the future"; else fail "state expiry is in the future"; fi
+
+# --- scenario: a restart restores the remaining ban time -----------------
+stop_daemon
+nft delete table inet athena 2>/dev/null   # simulate a reboot: kernel state gone
+: > "$work/ssh.log"
+start_daemon
+wait_for 5 banned 203.0.113.8 && pass "ban restored after a restart" || fail "ban restored after a restart"
+remaining=$(sed -nE 's/.*\[RESTORE\] 203\.0\.113\.8 \(([0-9]+)s remaining\).*/\1/p' "$work/athena.log" | tail -1)
+if [[ -n $remaining ]] && (( remaining > 0 && remaining <= 3600 )); then
+    pass "restored with the remaining time (${remaining}s)"
+else
+    fail "restored with the remaining time (got '${remaining}')"
+fi
+
+# --- scenario: expired records are not restored, and are pruned ----------
+stop_daemon
+nft delete table inet athena 2>/dev/null
+printf '203.0.113.77 %s\n' $(( $(date +%s) - 10 )) > "$work/state/bans"
+start_daemon
+sleep 2
+if banned 203.0.113.77; then fail "expired ban must not be restored"; else pass "expired ban not restored"; fi
+if grep -q '^203\.0\.113\.77 ' "$work/state/bans"; then
+    fail "expired record pruned from the state file"
+else
+    pass "expired record pruned from the state file"
+fi
 
 stop_daemon
 

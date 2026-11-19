@@ -129,7 +129,7 @@ list_bans() {
 }
 
 unban() {
-    local ip=$1 set
+    local ip=$1 set fd
     if ! is_valid_address "$ip"; then
         echo "Erreur : adresse IP invalide : '$ip'." >&2
         return 1
@@ -143,10 +143,17 @@ unban() {
         echo "$ip n'est pas bannie."
         return 2
     fi
-    if printf '%s\n' "$ip" >> "$UNBAN_QUEUE"; then
+    # Same lock as the daemon: the request must not be appended while the
+    # server is rotating the queue.
+    exec {fd}>>"$UNBAN_QUEUE.lock" || return 1
+    if flock -x "$fd" && printf '%s\n' "$ip" >> "$UNBAN_QUEUE"; then
+        flock -u "$fd"
+        exec {fd}>&-
         echo "Demande de débannissement pour $ip transmise au serveur (traitement dans la seconde)."
         return 0
     fi
+    flock -u "$fd" 2>/dev/null
+    exec {fd}>&-
     echo "Erreur : impossible d'écrire dans $UNBAN_QUEUE." >&2
     return 1
 }
