@@ -90,6 +90,11 @@ expect_nok  "whitelist: public v4 not listed"   is_whitelisted 203.0.113.5
 expect_nok  "whitelist: public v6 not listed"   is_whitelisted 2606:4700::1111
 export WHITE_LIST=""
 
+# --- set selection -------------------------------------------------------
+expect_eq   "set_for_ip: ipv4"              athena_blacklist  "$(set_for_ip 203.0.113.5)"
+expect_eq   "set_for_ip: ipv6"              athena_blacklist6 "$(set_for_ip 2001:db8::1)"
+expect_nok  "set_for_ip: rejects garbage"   set_for_ip "not-an-ip"
+
 # --- journal line parsing -------------------------------------------------
 line_pw='Nov 19 13:33:37 host sshd-session[1]: Failed password for root from 203.0.113.5 port 4444 ssh2'
 line_invalid='Nov 19 13:33:37 host sshd-session[1]: Failed password for invalid user admin from 203.0.113.9 port 4445 ssh2'

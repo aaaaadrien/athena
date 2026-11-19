@@ -91,7 +91,7 @@ THRESHOLD=2
 BAN_TIME=3600
 FIND_TIME=600
 CHECK_INTERVAL=1
-WHITE_LIST="127.0.0.1 192.168.50.0/24"
+WHITE_LIST="127.0.0.1 192.168.50.0/24 ::1 2001:db8:bad::/48"
 PORT_BLOCK=all
 CONF
 
@@ -167,10 +167,27 @@ sshd_line 203.0.113.8 " : RSA SHA256:abcdef" >> "$work/ssh.log"
 sshd_line 203.0.113.8 " : RSA SHA256:abcdef" >> "$work/ssh.log"
 wait_for 5 banned 203.0.113.8 && pass "ban with method suffix" || fail "ban with method suffix"
 
+# --- scenario: IPv6 sources are banned in their own set ------------------
+sshd_line 2001:db8::66 >> "$work/ssh.log"
+sshd_line 2001:db8::66 >> "$work/ssh.log"
+wait_for 5 banned 2001:db8::66 athena_blacklist6 \
+    && pass "ipv6 offender banned in the ipv6 set" || fail "ipv6 offender banned in the ipv6 set"
+
+sshd_line 2001:db8:bad::1 >> "$work/ssh.log"
+sshd_line 2001:db8:bad::1 >> "$work/ssh.log"
+sshd_line 2001:db8:bad::1 >> "$work/ssh.log"
+sleep 2
+if banned 2001:db8:bad::1 athena_blacklist6; then
+    fail "whitelisted ipv6 prefix must not be banned"
+else
+    pass "whitelisted ipv6 prefix not banned"
+fi
+
 # --- scenario: the CLI lists and unbans ----------------------------------
 ( cd "$work" && "$repo/athena" -l ) > "$work/list.out" 2>&1
 if grep -q '203.0.113.5' "$work/list.out"; then pass "athena -l lists banned ip"; else fail "athena -l lists banned ip"; fi
 if grep -qi 'aucun\|no ban' "$work/list.out"; then fail "athena -l must not claim the set is empty"; else pass "athena -l reports a non-empty set"; fi
+if grep -q '2001:db8::66' "$work/list.out"; then pass "athena -l lists the ipv6 ban"; else fail "athena -l lists the ipv6 ban"; fi
 
 ( cd "$work" && "$repo/athena" -u 203.0.113.5 ) > "$work/unban.out" 2>&1
 wait_for 5 bash -c "! nft get element inet athena athena_blacklist '{ 203.0.113.5 }' >/dev/null 2>&1" \
@@ -183,6 +200,10 @@ grep -qi 'not banned\|pas banni' "$work/unban2.out" && pass "athena -u on a clea
 ( cd "$work" && "$repo/athena" -u "not-an-ip" ) > "$work/unban3.out" 2>&1
 grep -qiE 'invalid|invalide' "$work/unban3.out" && pass "athena -u rejects garbage" \
     || fail "athena -u rejects garbage"
+
+( cd "$work" && "$repo/athena" -u 2001:db8::66 ) > "$work/unban6.out" 2>&1
+wait_for 5 bash -c "! nft get element inet athena athena_blacklist6 '{ 2001:db8::66 }' >/dev/null 2>&1" \
+    && pass "athena -u removes an ipv6 address" || fail "athena -u removes an ipv6 address"
 
 # --- scenario: a manual unban is not undone by the next scan -------------
 sshd_line 198.51.100.20 >> "$work/ssh.log"
@@ -207,11 +228,18 @@ state_expiry=${state_line##* }
 if (( state_expiry > $(date +%s) )); then pass "state expiry is in the future"; else fail "state expiry is in the future"; fi
 
 # --- scenario: a restart restores the remaining ban time -----------------
+sshd_line 2001:db8::99 >> "$work/ssh.log"
+sshd_line 2001:db8::99 >> "$work/ssh.log"
+wait_for 5 banned 2001:db8::99 athena_blacklist6 \
+    && pass "ipv6 offender banned before restart" || fail "ipv6 offender banned before restart"
+
 stop_daemon
 nft delete table inet athena 2>/dev/null   # simulate a reboot: kernel state gone
 : > "$work/ssh.log"
 start_daemon
 wait_for 5 banned 203.0.113.8 && pass "ban restored after a restart" || fail "ban restored after a restart"
+wait_for 5 banned 2001:db8::99 athena_blacklist6 \
+    && pass "ipv6 ban restored after a restart" || fail "ipv6 ban restored after a restart"
 remaining=$(sed -nE 's/.*\[RESTORE\] 203\.0\.113\.8 \(([0-9]+)s remaining\).*/\1/p' "$work/athena.log" | tail -1)
 if [[ -n $remaining ]] && (( remaining > 0 && remaining <= 3600 )); then
     pass "restored with the remaining time (${remaining}s)"

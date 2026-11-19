@@ -8,6 +8,7 @@ export PATH
 
 TABLE_NAME=athena
 SET_V4=athena_blacklist
+SET_V6=athena_blacklist6
 
 VERSION_FILE=${ATHENA_VERSION_FILE:-/usr/share/athena/VERSION}
 RUN_DIR=${ATHENA_RUN_DIR:-/run/athena}
@@ -44,6 +45,16 @@ is_ipv6() {
 
 is_valid_address() {
     is_ipv4 "$1" || is_ipv6 "$1"
+}
+
+set_for_ip() {
+    if is_ipv4 "$1"; then
+        printf '%s' "$SET_V4"
+    elif is_ipv6 "$1"; then
+        printf '%s' "$SET_V6"
+    else
+        return 1
+    fi
 }
 
 # Converts an nftables duration ("1h2m", "59m59s", "45s998ms") to seconds.
@@ -94,7 +105,9 @@ set_elements() {
     local set=$1 raw line ip expires
     raw=$(nft list set inet "$TABLE_NAME" "$set" 2>/dev/null) || return 1
     [[ -n $raw ]] || return 1
-    while IFS= read -r line; do
+    # `|| [[ -n $line ]]`: the last element has no trailing newline, and a
+    # plain `while read` would silently drop it.
+    while IFS= read -r line || [[ -n $line ]]; do
         line=${line#"${line%%[![:space:]]*}"}
         ip=${line%% *}
         [[ -n $ip ]] || continue
@@ -104,23 +117,25 @@ set_elements() {
         fi
         printf '%s %s\n' "$ip" "${expires:--}"
     done < <(printf '%s\n' "$raw" | tr -d '\n\t' \
-             | sed -E 's/^.*elements[[:space:]]*=[[:space:]]*\{//; s/\}[^}]*$//' \
+             | sed -E 's/^.*elements[[:space:]]*=[[:space:]]*\{//; s/[{}[:space:]]*$//' \
              | tr ',' '\n')
 }
 
 list_bans() {
-    local found=0 ip rem secs
+    local found=0 ip rem secs set
     echo "--- Athena : adresses bannies ---"
-    while IFS=' ' read -r ip rem; do
-        [[ -n $ip ]] || continue
-        found=$(( found + 1 ))
-        if [[ $rem == - ]]; then
-            printf '  %-39s %s\n' "$ip" "sans expiration"
-        else
-            secs=$(duration_to_seconds "$rem") || secs=0
-            printf '  %-39s %s\n' "$ip" "$(human_duration "$secs")"
-        fi
-    done < <(set_elements "$SET_V4")
+    for set in "$SET_V4" "$SET_V6"; do
+        while IFS=' ' read -r ip rem || [[ -n $ip ]]; do
+            [[ -n $ip ]] || continue
+            found=$(( found + 1 ))
+            if [[ $rem == - ]]; then
+                printf '  %-39s %s\n' "$ip" "sans expiration"
+            else
+                secs=$(duration_to_seconds "$rem") || secs=0
+                printf '  %-39s %s\n' "$ip" "$(human_duration "$secs")"
+            fi
+        done < <(set_elements "$set")
+    done
     if (( found == 0 )); then
         echo "Aucune adresse bannie."
     else
@@ -138,7 +153,7 @@ unban() {
         echo "Erreur : $RUN_DIR n'existe pas. Le serveur Athena est-il démarré ?" >&2
         return 1
     fi
-    set=$SET_V4
+    set=$(set_for_ip "$ip") || return 1
     if ! nft get element inet "$TABLE_NAME" "$set" "{ $ip }" >/dev/null 2>&1; then
         echo "$ip n'est pas bannie."
         return 2
