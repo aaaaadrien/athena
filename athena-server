@@ -26,7 +26,12 @@ STATE_FILE=$STATE_DIR/bans
 # ip -> epoch until which a manually unbanned address is left alone.
 declare -A BANS=()
 declare -A GRACE=()
+# ip -> space separated epochs of its recent failures (at most THRESHOLD).
+declare -A FAILS=()
 STATE_DIRTY=0
+# File descriptor of the running `journalctl -f`.
+STREAM_FD=""
+
 
 # Defaults; each of these can be overridden from athena.conf.
 THRESHOLD=${THRESHOLD:-2}
@@ -62,11 +67,12 @@ athena_version() {
     printf '%s\n' "${v:-dev}"
 }
 
-# Prints the -t arguments expected by journalctl, one per SSH_LOG_TAGS entry.
-journal_args() {
+# Fills JMATCH with one `-t <identifier>` per SSH_LOG_TAGS entry.
+journal_match_args() {
     local tag
+    JMATCH=()
     for tag in $SSH_LOG_TAGS; do
-        printf -- '-t\n%s\n' "$tag"
+        JMATCH+=(-t "$tag")
     done
 }
 
@@ -352,16 +358,79 @@ unban_ip() {
     return 1
 }
 
-# Prints every source address that failed at least THRESHOLD times inside the
-# finding window.
-failed_sources() {
+# ---------------------------------------------------------------------------
+# Failure counting
+#
+# The daemon used to re-read the last FIND_TIME seconds of journal on every
+# cycle: journalctl then costs ~6 ms per cycle, whatever `--since` or
+# `--after-cursor` is used, because opening the journal dominates. Instead the
+# journal is followed once on a dedicated descriptor and the failures are
+# counted in memory, so an idle daemon costs nothing and only an actual
+# failure costs a `grep`-free function call.
+# ---------------------------------------------------------------------------
+
+is_ssh_failure() {
+    local line=$1
+    [[ $line == *Failed\ password* || $line == *Failed\ publickey* \
+       || $line == *Failed\ keyboard-interactive* ]]
+}
+
+# Records one failure for the address it comes from and bans it as soon as
+# THRESHOLD failures fall inside the finding window.
+record_failure() {
+    local line=$1 ip ts t
+    local -a times=() kept=()
+
+    is_ssh_failure "$line" || return 1
+    ip=$(extract_ip "$line") || return 1
+    is_whitelisted "$ip" && return 1
+    [[ -n ${BANS[$ip]:-} ]] && return 1
+    if [[ -n ${GRACE[$ip]:-} ]] && (( ${GRACE[$ip]} > $(now) )); then
+        return 1
+    fi
+
+    ts=$(now)
+    IFS=' ' read -ra times <<< "${FAILS[$ip]:-}"
+    for t in "${times[@]}"; do
+        (( ts - t < FIND_TIME )) && kept+=("$t")
+    done
+    kept+=("$ts")
+    # Only the last THRESHOLD timestamps matter: an older one cannot trigger a
+    # ban, and keeping every attempt of a flood would grow without bound.
+    while (( ${#kept[@]} > THRESHOLD )); do
+        kept=("${kept[@]:1}")
+    done
+
+    if (( ${#kept[@]} >= THRESHOLD )) && ban_ip "$ip"; then
+        unset "FAILS[$ip]"
+        return 0
+    fi
+    FAILS[$ip]="${kept[*]}"
+    return 1
+}
+
+# Replays the finding window once at startup, so a restart does not blind the
+# daemon for FIND_TIME. The journal is read with -o cat, which drops the
+# timestamp: those attempts are counted as if they had just happened.
+seed_window() {
+    local line
     local -a args=(journalctl -q --no-pager -o cat --since "-${FIND_TIME} seconds")
-    local a
-    while IFS= read -r a; do args+=("$a"); done < <(journal_args)
-    "${args[@]}" 2>/dev/null \
-        | grep -E 'Failed (password|publickey|keyboard-interactive)' \
-        | sed -nE 's/.*from ([0-9a-fA-F.:]+) port [0-9]+.*/\1/p' \
-        | awk -v limit="$THRESHOLD" '{ n[$1]++ } END { for (ip in n) if (n[ip] >= limit) print ip }'
+    journal_match_args
+    args+=("${JMATCH[@]}")
+    while IFS= read -r line; do
+        record_failure "$line"
+    done < <("${args[@]}" 2>/dev/null)
+}
+
+start_stream() {
+    journal_match_args
+    exec {STREAM_FD}< <(journalctl -q -f -n 0 -o cat "${JMATCH[@]}" 2>/dev/null)
+}
+
+stop_stream() {
+    [[ -n $STREAM_FD ]] || return 0
+    exec {STREAM_FD}>&-
+    STREAM_FD=""
 }
 
 process_unban_queue() {
@@ -578,14 +647,43 @@ main() {
     init_firewall
     restore_bans
 
-    trap '(( STATE_DIRTY )) && state_save; log_event "[INFO] Athena Server stopping"; exit 0' TERM INT
+    trap 'stop_stream; (( STATE_DIRTY )) && state_save; log_event "[INFO] Athena Server stopping"; exit 0' TERM INT
+
+    seed_window
+    start_stream
+    log_event "[INFO] watching sshd failures (identifiers: $SSH_LOG_TAGS)"
+
+    local line rc last_house
+    last_house=$(now)
     while :; do
-        housekeeping
-        while IFS= read -r ip; do
-            [[ -n $ip ]] || continue
-            ban_ip "$ip"
-        done < <(failed_sources)
-        sleep "$CHECK_INTERVAL"
+        # Read one journal entry, or wake up after CHECK_INTERVAL to run the
+        # housekeeping: no journalctl call, and therefore no fork, per cycle.
+        if IFS= read -r -t "$CHECK_INTERVAL" -u "$STREAM_FD" line; then
+            record_failure "$line"
+            line=""
+        else
+            rc=$?
+            if (( rc > 128 )); then
+                # Timed out: nothing happened. A partial line is still worth
+                # parsing, the address is always at the beginning.
+                if [[ -n $line ]]; then
+                    record_failure "$line"
+                    line=""
+                fi
+            else
+                # EOF: journalctl exited (journal rotation, restart, or it was
+                # killed). Reconnect and re-seed so no attempt is missed.
+                log_event "[WARN] journal stream ended, reconnecting"
+                sleep 1
+                stop_stream
+                start_stream
+                seed_window
+            fi
+        fi
+        if (( $(now) - last_house >= CHECK_INTERVAL )); then
+            housekeeping
+            last_house=$(now)
+        fi
     done
 }
 

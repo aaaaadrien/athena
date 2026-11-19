@@ -49,9 +49,12 @@ mkdir -p "$work/bin" "$work/run" "$work/state"
 # --- stubs ----------------------------------------------------------------
 cat > "$work/bin/journalctl" <<'STUB'
 #!/usr/bin/env bash
-# Minimal journalctl stand-in: replays STUB_SSH_LOG for sshd queries, and
-# STUB_ATHENA_LOG for `-t athena` (Athena's own events).
+# Minimal journalctl stand-in.
+#   STUB_SSH_LOG  entries that appear while the daemon runs (followed with -f)
+#   STUB_SEED_LOG entries already in the journal when the daemon starts
+#   STUB_ATHENA_LOG Athena's own [BAN]/[UNBAN] events (`-t athena`)
 stream=${STUB_SSH_LOG:-/dev/null}
+seed=${STUB_SEED_LOG:-/dev/null}
 own=${STUB_ATHENA_LOG:-/dev/null}
 follow=0
 own_query=0
@@ -65,8 +68,14 @@ if (( own_query )); then
     [[ -r $own ]] && cat "$own"
     exit 0
 fi
-[[ -r $stream ]] && cat "$stream"
-(( follow )) && sleep 3600
+if (( follow )); then
+    if [[ -r $stream ]]; then
+        exec tail -n +1 -f "$stream"
+    fi
+    sleep 3600
+    exit 0
+fi
+[[ -r $seed ]] && cat "$seed"
 exit 0
 STUB
 
@@ -96,6 +105,7 @@ PORT_BLOCK=all
 CONF
 
 : > "$work/ssh.log"
+: > "$work/seed.log"
 : > "$work/athena.log"
 
 sshd_line() {   # sshd_line <ip> [suffix]
@@ -104,6 +114,7 @@ sshd_line() {   # sshd_line <ip> [suffix]
 
 export PATH="$work/bin:$PATH"
 export STUB_SSH_LOG="$work/ssh.log"
+export STUB_SEED_LOG="$work/seed.log"
 export STUB_ATHENA_LOG="$work/athena.log"
 export STUB_ATHENA_EVENTS="$work/athena.log"
 export ATHENA_CONF="$work/athena.conf"

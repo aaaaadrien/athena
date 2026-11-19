@@ -120,8 +120,8 @@ expect_nok "extract_ip: rsa suffix not read as port" test "$(extract_ip "$line_r
 
 # --- journalctl argument building ----------------------------------------
 export SSH_LOG_TAGS="sshd sshd-session"
-expect_eq "journal_args: two tags" \
-    "$(printf -- '-t\nsshd\n-t\nsshd-session')" "$(journal_args)"
+journal_match_args
+expect_eq "journal_match_args: two tags" "-t sshd -t sshd-session" "${JMATCH[*]}"
 
 echo
 if (( FAILED )); then
