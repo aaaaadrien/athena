@@ -123,6 +123,34 @@ export SSH_LOG_TAGS="sshd sshd-session"
 journal_match_args
 expect_eq "journal_match_args: two tags" "-t sshd -t sshd-session" "${JMATCH[*]}"
 
+# --- state pruning -------------------------------------------------------
+# `now` is overridden so the test does not depend on the wall clock.
+FAKE_NOW=1700000000
+now() { printf '%s' "$FAKE_NOW"; }
+export FIND_TIME=600
+export NEXT_FAIL_PRUNE=0
+BANS=()
+GRACE=()
+FAILS=()
+# Helpers rather than `FAILS[10.0.0.1]=…`: a literal index reads as an
+# arithmetic expression to ShellCheck.
+set_fail() { FAILS[$1]="$2"; }
+set_grace() { GRACE[$1]=$2; }
+set_ban() { BANS[$1]=$2; }
+set_fail 203.0.113.5 1700000000             # inside the window
+set_fail 198.51.100.9 1699999000            # 1000 s ago: out of the window
+set_fail 192.0.2.7 "1699999000 1699999700"  # one out (1000 s), one in (300 s)
+set_grace 203.0.113.9 1699999999            # expired
+set_ban 198.51.100.3 1700000600             # still active
+set_ban 198.51.100.4 1699999999             # expired
+prune_state
+expect_eq "prune: failure inside the window kept" "1700000000" "${FAILS[203.0.113.5]:-}"
+expect_eq "prune: failure outside the window dropped" "" "${FAILS[198.51.100.9]:-}"
+expect_eq "prune: only the recent timestamps kept" "1699999700" "${FAILS[192.0.2.7]:-}"
+expect_eq "prune: expired grace period dropped" "" "${GRACE[203.0.113.9]:-}"
+expect_eq "prune: active ban kept" "1700000600" "${BANS[198.51.100.3]:-}"
+expect_eq "prune: expired ban dropped" "" "${BANS[198.51.100.4]:-}"
+
 echo
 if (( FAILED )); then
     echo "FAILED"

@@ -31,6 +31,8 @@ declare -A FAILS=()
 STATE_DIRTY=0
 # File descriptor of the running `journalctl -f`.
 STREAM_FD=""
+# When the failure table is due for pruning (see prune_failures).
+NEXT_FAIL_PRUNE=0
 
 
 # Defaults; each of these can be overridden from athena.conf.
@@ -130,10 +132,10 @@ ipv6_words() {
     done
 
     W=(
-        $(( (16#${h[0]} << 16) | 16#${h[1]} ))
-        $(( (16#${h[2]} << 16) | 16#${h[3]} ))
-        $(( (16#${h[4]} << 16) | 16#${h[5]} ))
-        $(( (16#${h[6]} << 16) | 16#${h[7]} ))
+        "$(( (16#${h[0]} << 16) | 16#${h[1]} ))"
+        "$(( (16#${h[2]} << 16) | 16#${h[3]} ))"
+        "$(( (16#${h[4]} << 16) | 16#${h[5]} ))"
+        "$(( (16#${h[6]} << 16) | 16#${h[7]} ))"
     )
     return 0
 }
@@ -501,6 +503,31 @@ state_save() {
     return 1
 }
 
+# Forgets the failures that left the finding window. Without it the table
+# grows with every address that failed once — a scan from a /16 would keep
+# 65k entries for the lifetime of the daemon. The work is amortised: the table
+# is only walked once every FIND_TIME/10 at most.
+prune_failures() {
+    local ip n t kept
+    local -a timestamps=()
+    n=$(now)
+    (( n >= NEXT_FAIL_PRUNE )) || return 0
+    NEXT_FAIL_PRUNE=$(( n + (FIND_TIME / 10 > 1 ? FIND_TIME / 10 : 1) ))
+    for ip in "${!FAILS[@]}"; do
+        timestamps=()
+        IFS=' ' read -ra timestamps <<< "${FAILS[$ip]}"
+        kept=()
+        for t in "${timestamps[@]}"; do
+            (( n - t < FIND_TIME )) && kept+=("$t")
+        done
+        if (( ${#kept[@]} == 0 )); then
+            unset "FAILS[$ip]"
+        else
+            FAILS[$ip]="${kept[*]}"
+        fi
+    done
+}
+
 # Drops the records the kernel has already expired, and the grace periods
 # that are over. No nft call: the expiry recorded at ban time is the timeout
 # handed to the kernel, so both end together.
@@ -516,6 +543,7 @@ prune_state() {
             STATE_DIRTY=1
         fi
     done
+    prune_failures
 }
 
 restore_bans() {
