@@ -1,0 +1,5 @@
+# Nothing here is generated: keep the tree clean of editor and test leftovers.
+*.swp
+*~
+*.log
+.DS_Store
